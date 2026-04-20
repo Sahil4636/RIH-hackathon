@@ -8,11 +8,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 from datetime import datetime
 
 from backend.api import get_risk_for_coin, get_market_overview, get_historical, get_fear_greed
 from backend.data_fetcher import TOP_COINS, fetch_all_historical, fetch_coin_news_headlines
 from backend.risk_engine import compute_all_risks, WEIGHTS
+from backend.ml_model import train_models, load_models, predict_risk, extract_features, get_shap_values
+from backend.whale_alert import fetch_whale_transactions, compute_whale_signals, whale_alert_level
 from frontend.charts import (
     price_chart, volatility_chart, risk_radar,
     fear_greed_gauge, leaderboard_chart, ma_comparison_chart,
@@ -78,6 +81,21 @@ _re.WEIGHTS = {
 
 refresh = st.sidebar.button("🔄 Refresh Data", use_container_width=True)
 
+st.sidebar.divider()
+st.sidebar.markdown("### 🐋 Whale Alert")
+whale_api_key = st.sidebar.text_input(
+    "Whale Alert API Key",
+    value="", type="password",
+    placeholder="Paste free key from whale-alert.io",
+    help="Leave blank to use demo data.",
+)
+whale_min_usd = st.sidebar.select_slider(
+    "Min Transaction Size",
+    options=[100_000, 500_000, 1_000_000, 5_000_000, 10_000_000],
+    value=500_000,
+    format_func=lambda x: f"${x/1_000_000:.1f}M",
+)
+
 # ─────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────
@@ -99,6 +117,24 @@ with st.spinner("⏳ Loading market data…"):
     except Exception as e:
         st.error(f"Failed to load data: {e}")
         st.stop()
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_whale(api_key, min_usd):
+    return fetch_whale_transactions(api_key or "YOUR_API_KEY", min_usd=min_usd)
+
+@st.cache_resource(show_spinner=False)
+def get_ml_models():
+    reg, clf, le = load_models()
+    if reg is None:
+        reg, clf, le, _ = train_models(n_samples=8000)
+    return reg, clf, le
+
+with st.spinner("🐋 Loading whale data…"):
+    whale_df = load_whale(whale_api_key, whale_min_usd)
+    whale_signals = compute_whale_signals(whale_df, selected_coins)
+
+with st.spinner("🤖 Loading ML model…"):
+    reg_model, clf_model, label_enc = get_ml_models()
 
 # ─────────────────────────────────────────────
 # HEADER KPIs
@@ -130,12 +166,14 @@ st.divider()
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🏆 Leaderboard",
     "🔍 Coin Analysis",
     "📈 Price Charts",
     "😱 Fear & Greed",
     "⚙️ Why Is This Risky?",
+    "🤖 ML Prediction",
+    "🐋 Whale Alerts",
 ])
 
 # ──── TAB 1: LEADERBOARD ────
@@ -304,6 +342,152 @@ with tab5:
             st.metric("Volume Ratio",           f"{d.get('volume_ratio',1):.2f}x avg")
             st.metric("Fear & Greed",           f"{d.get('fear_greed_value',50):.0f}/100")
 
+
+# ──── TAB 6: ML PREDICTION ────
+with tab6:
+    st.subheader("🤖 XGBoost ML Risk Prediction")
+    st.caption("15-feature model — predicts Risk Score (0–100) and Risk Level")
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Model",         "XGBoost")
+    col_m2.metric("Features",      "15")
+    col_m3.metric("Train Samples", "8,000")
+    st.divider()
+
+    ml_rows = []
+    for _, mrow in market_df.iterrows():
+        cid = mrow["id"]
+        coin_hist_s = pd.Series(dtype=float)
+        if not hist_df.empty and "coin" in hist_df.columns and cid in hist_df["coin"].values:
+            coin_hist_s = hist_df[hist_df["coin"] == cid]["close"]
+
+        if coin_hist_s.empty:
+            feats = {
+                "volatility_30d": abs(mrow.get("change_7d_pct", 0)) / 7,
+                "volatility_7d": abs(mrow.get("change_24h_pct", 0)),
+                "drawdown_from_ath": abs(mrow.get("ath_change_pct", 0)),
+                "price_change_24h": mrow.get("change_24h_pct", 0),
+                "price_change_7d": mrow.get("change_7d_pct", 0),
+                "volume_to_mcap": mrow.get("volume_24h", 0) / max(mrow.get("market_cap", 1), 1),
+                "rsi_14": 50.0, "fear_greed": float(fg_df.sort_values("date").iloc[-1]["fg_value"]) if not fg_df.empty else 50.0,
+                "fg_trend": 0.0, "mcap_rank_score": 0.5,
+                "consecutive_red_days": 1 if mrow.get("change_24h_pct", 0) < 0 else 0,
+                "avg_volume_ratio": 1.0, "whale_tx_count": 0, "whale_volume_usd": 0.0, "whale_risk_score": 0.0,
+            }
+        else:
+            rank = int(market_df[market_df["id"] == cid].index[0])
+            feats = extract_features(mrow.to_dict(), coin_hist_s,
+                fg_df.set_index("date")["fg_value"] if not fg_df.empty else pd.Series(dtype=float),
+                rank, len(market_df))
+
+        if cid in whale_signals.index:
+            ws = whale_signals.loc[cid]
+            feats["whale_tx_count"]   = int(ws["whale_tx_count"])
+            feats["whale_volume_usd"] = round(float(ws["whale_volume_usd"]) / 1_000_000, 2)
+            feats["whale_risk_score"] = float(ws["whale_risk_score"])
+
+        pred = predict_risk(feats, reg_model, clf_model, label_enc)
+        rule_score = next((r["risk_score"] for r in risk_results if r["coin"] == cid), 0.0)
+        ml_rows.append({
+            "Symbol": mrow.get("symbol", cid).upper(), "Name": mrow.get("name", cid),
+            "Rule Score": round(rule_score, 1), "ML Score": pred["ml_score"],
+            "ML Label": pred["ml_label"], "Confidence": f"{pred['confidence']*100:.0f}%",
+            "Delta": round(pred["ml_score"] - rule_score, 1),
+            "_feats": feats, "_probs": pred["class_probs"],
+        })
+
+    ml_df = pd.DataFrame(ml_rows)
+    compare_df = ml_df[["Symbol", "Rule Score", "ML Score"]].melt(id_vars="Symbol", var_name="Method", value_name="Score")
+    fig_compare = px.bar(compare_df, x="Symbol", y="Score", color="Method", barmode="group",
+        color_discrete_map={"Rule Score": "#3498db", "ML Score": "#e74c3c"},
+        title="Rule-Based vs XGBoost ML Score")
+    fig_compare.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117", font_color="white", height=380)
+    st.plotly_chart(fig_compare, use_container_width=True)
+
+    st.dataframe(ml_df[["Symbol","Name","Rule Score","ML Score","ML Label","Confidence","Delta"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "ML Score":   st.column_config.ProgressColumn("ML Score",   min_value=0, max_value=100, format="%d"),
+            "Rule Score": st.column_config.ProgressColumn("Rule Score", min_value=0, max_value=100, format="%d"),
+            "Delta":      st.column_config.NumberColumn("ML−Rule", format="%+.1f"),
+        })
+
+    st.divider()
+    st.subheader("🔍 SHAP Explainability")
+    ml_coin = st.selectbox("Coin for SHAP breakdown", options=ml_df["Symbol"].tolist(), key="ml_shap")
+    sel_ml  = ml_df[ml_df["Symbol"] == ml_coin].iloc[0]
+    probs   = sel_ml["_probs"]
+    prob_df = pd.DataFrame({"Level": list(probs.keys()), "Probability": list(probs.values())})
+    fig_donut = px.pie(prob_df, names="Level", values="Probability", hole=0.55, color="Level",
+        color_discrete_map={"Low":"#2ecc71","Medium":"#f1c40f","High":"#e67e22","Extreme":"#e74c3c"},
+        title=f"{ml_coin} — Risk Level Probabilities")
+    fig_donut.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117", font_color="white", height=300)
+    st.plotly_chart(fig_donut, use_container_width=True)
+
+    shap_vals = get_shap_values(sel_ml["_feats"], reg_model)
+    if shap_vals:
+        shap_df = pd.DataFrame({"Feature": list(shap_vals.keys()), "SHAP Value": list(shap_vals.values())}).head(15)
+        shap_df["Direction"] = shap_df["SHAP Value"].apply(lambda v: "Increases Risk" if v > 0 else "Decreases Risk")
+        fig_shap = px.bar(shap_df, x="SHAP Value", y="Feature", color="Direction", orientation="h",
+            color_discrete_map={"Increases Risk":"#e74c3c","Decreases Risk":"#2ecc71"},
+            title=f"SHAP Feature Impact — {ml_coin}")
+        fig_shap.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117", font_color="white",
+            height=420, yaxis={"categoryorder":"total ascending"})
+        st.plotly_chart(fig_shap, use_container_width=True)
+    else:
+        st.info("Install `shap` to see feature contributions: `pip install shap`")
+
+# ──── TAB 7: WHALE ALERTS ────
+with tab7:
+    st.subheader("🐋 Whale Alert — Large Transaction Monitor")
+    if not whale_api_key:
+        st.info("ℹ️ No API key — showing **demo data**. Get a free key at [whale-alert.io](https://whale-alert.io) and paste in the sidebar.")
+
+    st.markdown("#### Whale Activity per Coin")
+    wcols = st.columns(min(len(selected_coins), 5))
+    for i, cid in enumerate(selected_coins[:5]):
+        with wcols[i % 5]:
+            if cid in whale_signals.index:
+                ws = whale_signals.loc[cid]
+                level, color = whale_alert_level(ws["whale_risk_score"])
+                vol_m = ws["whale_volume_usd"] / 1_000_000
+                st.markdown(f"""<div style="background:#1e1e2e;border:1px solid {color};border-radius:10px;
+                    padding:12px;text-align:center;">
+                    <div style="font-size:11px;color:#aaa;">{cid[:6].upper()}</div>
+                    <div style="font-size:1.1rem;font-weight:600;color:{color};">{level}</div>
+                    <div style="font-size:12px;color:#aaa;">{int(ws["whale_tx_count"])} txs · ${vol_m:.1f}M</div>
+                    </div>""", unsafe_allow_html=True)
+
+    st.divider()
+    if not whale_signals.empty:
+        ws_plot = whale_signals.reset_index()
+        ws_plot["vol_M"] = ws_plot["whale_volume_usd"] / 1_000_000
+        fig_wv = px.bar(ws_plot, x="coin_id", y="vol_M", color="whale_risk_score",
+            color_continuous_scale=["#2ecc71","#f1c40f","#e67e22","#e74c3c"],
+            range_color=[0,100], text="whale_tx_count",
+            title="Whale Volume ($M) & Transaction Count per Coin",
+            labels={"vol_M":"Volume ($M)","coin_id":"Coin"})
+        fig_wv.update_traces(texttemplate="%{text} txs", textposition="outside")
+        fig_wv.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117", font_color="white", height=380)
+        st.plotly_chart(fig_wv, use_container_width=True)
+
+    st.markdown("#### 📡 Live Transaction Feed")
+    if whale_df.empty:
+        st.warning("No whale transactions found.")
+    else:
+        feed = whale_df.copy()
+        feed["amount_usd"] = feed["amount_usd"].apply(lambda x: f"${x/1_000_000:.2f}M")
+        feed["amount"]     = feed["amount"].apply(lambda x: f"{x:,.0f}")
+        feed["timestamp"]  = feed["timestamp"].dt.strftime("%H:%M:%S UTC")
+        feed["signal"]     = feed["risk_weight"].apply(
+            lambda w: "🔴 SELL PRESSURE" if w>=4 else "🟠 LARGE MOVE" if w>=3 else "🟡 TRANSFER" if w>=2 else "🟢 ACCUMULATION")
+        st.dataframe(
+            feed[["timestamp","symbol","amount","amount_usd","tx_type","from_type","to_type","signal","hash"]].rename(columns={
+                "timestamp":"Time","symbol":"Coin","amount":"Amount","amount_usd":"USD Value",
+                "tx_type":"Type","from_type":"From","to_type":"To","signal":"Signal","hash":"Tx Hash"}),
+            use_container_width=True, hide_index=True)
+        st.caption("🐋 Wallet→Exchange = sell pressure · Exchange→Wallet = accumulation · Refreshes every 2 min")
+
 st.divider()
-st.caption("⚡ Built with Streamlit · CoinGecko · Alternative.me · VADER Sentiment · "
-           "For hackathon/educational use only. Not financial advice.")
+st.caption("⚡ Streamlit · CoinGecko · Alternative.me · VADER Sentiment · XGBoost · Whale Alert · For hackathon use only.")
+
