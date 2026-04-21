@@ -140,7 +140,7 @@ hr { border-color: var(--line) !important; }
 
 with st.sidebar:
     st.markdown("### Crypto Risk Analyzer")
-    st.caption("BlockSage-style stable UI")
+    st.caption("stable UI")
     st.divider()
 
     if "selected_coins_state" not in st.session_state:
@@ -469,7 +469,7 @@ with tab4:
             c3.metric("Avg Daily Return (arith)", f"{(dret.mean()*100 if len(dret) else 0):+.3f}%")
             c4.metric("Avg Daily Return (log)", f"{(lret.mean()*100 if len(lret) else 0):+.3f}%")
 
-            with st.expander("Feature explanations (from BlockSage abstract)", expanded=False):
+            with st.expander("Feature explanations ", expanded=False):
                 st.markdown(
                     """
 - **Volatility:** Annualized standard deviation of daily returns.
